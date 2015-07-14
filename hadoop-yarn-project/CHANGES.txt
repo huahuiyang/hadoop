@@ -175,6 +175,9 @@ Release 2.8.0 - UNRELEASED
     YARN-4055. Report node resource utilization in heartbeat. 
     (Inigo Goiri via kasha)
 
+    YARN-3866. AM-RM protocol changes to support container resizing. (Meng Ding
+    via jianhe)
+
   IMPROVEMENTS
 
     YARN-644. Basic null check is not performed on passed in arguments before
