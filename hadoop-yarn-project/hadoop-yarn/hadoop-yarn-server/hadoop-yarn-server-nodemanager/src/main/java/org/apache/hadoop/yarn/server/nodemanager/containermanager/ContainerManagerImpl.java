@@ -755,31 +755,36 @@ public class ContainerManagerImpl extends CompositeService implements
     List<ContainerId> succeededContainers = new ArrayList<ContainerId>();
     Map<ContainerId, SerializedException> failedContainers =
         new HashMap<ContainerId, SerializedException>();
-    for (StartContainerRequest request : requests.getStartContainerRequests()) {
-      ContainerId containerId = null;
-      try {
-        if (request.getContainerToken() == null ||
-            request.getContainerToken().getIdentifier() == null) {
-          throw new IOException(INVALID_CONTAINERTOKEN_MSG);
+    // Synchronize with NodeStatusUpdaterImpl#registerWithRM
+    // to avoid race condition during NM-RM resync (due to RM restart) while a
+    // container is being started, in particular when the container has not yet
+    // been added to the containers map in NMContext.
+    synchronized (this.context) {
+      for (StartContainerRequest request : requests.getStartContainerRequests()) {
+        ContainerId containerId = null;
+        try {
+          if (request.getContainerToken() == null ||
+              request.getContainerToken().getIdentifier() == null) {
+            throw new IOException(INVALID_CONTAINERTOKEN_MSG);
+          }
+          ContainerTokenIdentifier containerTokenIdentifier =
+              BuilderUtils.newContainerTokenIdentifier(request.getContainerToken());
+          verifyAndGetContainerTokenIdentifier(request.getContainerToken(),
+              containerTokenIdentifier);
+          containerId = containerTokenIdentifier.getContainerID();
+          startContainerInternal(nmTokenIdentifier, containerTokenIdentifier,
+              request);
+          succeededContainers.add(containerId);
+        } catch (YarnException e) {
+          failedContainers.put(containerId, SerializedException.newInstance(e));
+        } catch (InvalidToken ie) {
+          failedContainers.put(containerId, SerializedException.newInstance(ie));
+          throw ie;
+        } catch (IOException e) {
+          throw RPCUtil.getRemoteException(e);
         }
-        ContainerTokenIdentifier containerTokenIdentifier =
-            BuilderUtils.newContainerTokenIdentifier(request.getContainerToken());
-        verifyAndGetContainerTokenIdentifier(request.getContainerToken(),
-          containerTokenIdentifier);
-        containerId = containerTokenIdentifier.getContainerID();
-        startContainerInternal(nmTokenIdentifier, containerTokenIdentifier,
-          request);
-        succeededContainers.add(containerId);
-      } catch (YarnException e) {
-        failedContainers.put(containerId, SerializedException.newInstance(e));
-      } catch (InvalidToken ie) {
-        failedContainers.put(containerId, SerializedException.newInstance(ie));
-        throw ie;
-      } catch (IOException e) {
-        throw RPCUtil.getRemoteException(e);
       }
     }
-
     return StartContainersResponse.newInstance(getAuxServiceMetaData(),
       succeededContainers, failedContainers);
   }
@@ -961,32 +966,39 @@ public class ContainerManagerImpl extends CompositeService implements
         = new ArrayList<ContainerId>();
     Map<ContainerId, SerializedException> failedContainers =
         new HashMap<ContainerId, SerializedException>();
-    // Process container resource increase requests
-    for (org.apache.hadoop.yarn.api.records.Token token :
-        requests.getContainersToIncrease()) {
-      ContainerId containerId = null;
-      try {
-        if (token.getIdentifier() == null) {
-          throw new IOException(INVALID_CONTAINERTOKEN_MSG);
+    // Synchronize with NodeStatusUpdaterImpl#registerWithRM
+    // to avoid race condition during NM-RM resync (due to RM restart) while a
+    // container resource is being increased in NM, in particular when the
+    // increased container has not yet been added to the increasedContainers
+    // map in NMContext.
+    synchronized (this.context) {
+      // Process container resource increase requests
+      for (org.apache.hadoop.yarn.api.records.Token token :
+          requests.getContainersToIncrease()) {
+        ContainerId containerId = null;
+        try {
+          if (token.getIdentifier() == null) {
+            throw new IOException(INVALID_CONTAINERTOKEN_MSG);
+          }
+          ContainerTokenIdentifier containerTokenIdentifier =
+              BuilderUtils.newContainerTokenIdentifier(token);
+          verifyAndGetContainerTokenIdentifier(token,
+              containerTokenIdentifier);
+          authorizeStartAndResourceIncreaseRequest(
+              nmTokenIdentifier, containerTokenIdentifier, false);
+          containerId = containerTokenIdentifier.getContainerID();
+          // Reuse the startContainer logic to update NMToken,
+          // as container resource increase request will have come with
+          // an updated NMToken.
+          updateNMTokenIdentifier(nmTokenIdentifier);
+          Resource resource = containerTokenIdentifier.getResource();
+          changeContainerResourceInternal(containerId, resource, true);
+          successfullyIncreasedContainers.add(containerId);
+        } catch (YarnException | InvalidToken e) {
+          failedContainers.put(containerId, SerializedException.newInstance(e));
+        } catch (IOException e) {
+          throw RPCUtil.getRemoteException(e);
         }
-        ContainerTokenIdentifier containerTokenIdentifier =
-            BuilderUtils.newContainerTokenIdentifier(token);
-        verifyAndGetContainerTokenIdentifier(token,
-            containerTokenIdentifier);
-        authorizeStartAndResourceIncreaseRequest(
-            nmTokenIdentifier, containerTokenIdentifier, false);
-        containerId = containerTokenIdentifier.getContainerID();
-        // Reuse the startContainer logic to update NMToken,
-        // as container resource increase request will have come with
-        // an updated NMToken.
-        updateNMTokenIdentifier(nmTokenIdentifier);
-        Resource resource = containerTokenIdentifier.getResource();
-        changeContainerResourceInternal(containerId, resource, true);
-        successfullyIncreasedContainers.add(containerId);
-      } catch (YarnException | InvalidToken e) {
-        failedContainers.put(containerId, SerializedException.newInstance(e));
-      } catch (IOException e) {
-        throw RPCUtil.getRemoteException(e);
       }
     }
     return IncreaseContainersResourceResponse.newInstance(
@@ -1046,6 +1058,16 @@ public class ContainerManagerImpl extends CompositeService implements
           + targetResource.toString()
           + " is not smaller than the current resource "
           + currentResource.toString());
+    }
+    if (increase) {
+      org.apache.hadoop.yarn.api.records.Container increasedContainer =
+          org.apache.hadoop.yarn.api.records.Container.newInstance(
+              containerId, null, null, targetResource, null, null);
+      if (context.getIncreasedContainers().putIfAbsent(containerId,
+          increasedContainer) != null){
+        throw RPCUtil.getRemoteException("Container " + containerId.toString()
+            + " resource is being increased.");
+      }
     }
     this.readLock.lock();
     try {
